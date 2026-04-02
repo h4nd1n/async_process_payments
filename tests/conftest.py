@@ -13,12 +13,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 
-async def _dispose_app_engine() -> None:
-    from app.db.session import dispose_engine
-
-    await dispose_engine()
-
-
 def _to_asyncpg_dsn(url: str) -> str:
     if url.startswith("postgresql+asyncpg://"):
         return url
@@ -79,36 +73,31 @@ def _integration_db(postgres_connection_url: str, rabbitmq_connection_url: str) 
 
     yield
 
-    asyncio.run(_dispose_app_engine())
 
 
 @pytest.fixture
 async def api_client(_integration_db: None) -> AsyncIterator:
-    """У каждого теста новый async engine: пул привязан к циклу событий предыдущего (уже закрытого) теста."""
+    """Интеграционные тесты с изолированным lifespan."""
     from asgi_lifespan import LifespanManager
     from httpx import ASGITransport, AsyncClient
 
     from app.main import app
 
-    await _dispose_app_engine()
-    try:
-        async with LifespanManager(app):
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as client:
-                yield client
-    finally:
-        await _dispose_app_engine()
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
 
 
 @pytest.fixture
 async def db_session(_integration_db: None):
-    from app.db.session import get_async_session_maker
+    from app.config import get_settings
+    from app.db.session import setup_database
 
-    await _dispose_app_engine()
+    engine, maker = setup_database(get_settings().database_url)
     try:
-        maker = get_async_session_maker()
         async with maker() as session:
             yield session
             await session.rollback()
     finally:
-        await _dispose_app_engine()
+        await engine.dispose()

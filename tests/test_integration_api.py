@@ -112,9 +112,12 @@ async def test_missing_idempotency_422(api_client) -> None:
 async def test_process_payment_message_integration(db_session, monkeypatch: pytest.MonkeyPatch) -> None:
     import respx
 
-    from app.consumer.worker import process_payment_message
+    from app.consumer.worker import PaymentConsumerService
     from app.db.models import Currency, Payment, PaymentStatus
-    from app.db.session import get_async_session_maker
+    from app.config import get_settings
+    from app.db.session import setup_database
+    from app.repositories.uow import SqlAlchemyUnitOfWork
+    from unittest.mock import AsyncMock
 
     monkeypatch.setenv("WEBHOOK_MAX_ATTEMPTS", "2")
     monkeypatch.setenv("WEBHOOK_BACKOFF_BASE_SEC", "0.01")
@@ -143,12 +146,20 @@ async def test_process_payment_message_integration(db_session, monkeypatch: pyte
 
     with respx.mock:
         route = respx.post(hook).mock(return_value=httpx.Response(204))
-        await process_payment_message({"event": "payments.new", "payment_id": str(pid)})
+        
+        engine, maker = setup_database(get_settings().database_url)
+        from app.repositories.uow import build_uow_factory
+        uow_factory = build_uow_factory(maker)
+        consumer = PaymentConsumerService(broker=AsyncMock(), uow_factory=uow_factory)
+        
+        await consumer.process_payment_message({"event": "payments.new", "payment_id": str(pid)})
 
         assert route.call_count >= 1
-        maker = get_async_session_maker
-        async with maker()() as s:
+        
+        async with maker() as s:
             refreshed = await s.get(Payment, pid)
             assert refreshed is not None
             assert refreshed.status == PaymentStatus.succeeded
             assert refreshed.processed_at is not None
+            
+        await engine.dispose()

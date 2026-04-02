@@ -36,8 +36,11 @@ async def test_handle_retry_republishes_until_limit(monkeypatch: pytest.MonkeyPa
     broker = AsyncMock()
     body: dict[str, Any] = {"event": "payments.new", "payment_id": "00000000-0000-0000-0000-000000000001"}
 
+    from app.consumer.worker import PaymentConsumerService
+    consumer = PaymentConsumerService(broker, None)
+
     msg = _FakeRabbitMessage({})
-    await worker.handle_retry_or_dlq(body, msg, broker, RuntimeError("db down"))  # type: ignore[arg-type]
+    await consumer.handle_retry_or_dlq(body, msg, RuntimeError("db down"))  # type: ignore[arg-type]
     broker.publish.assert_awaited_once()
     args, kwargs = broker.publish.await_args_list[0]
     assert args[0] == body
@@ -46,13 +49,13 @@ async def test_handle_retry_republishes_until_limit(monkeypatch: pytest.MonkeyPa
 
     broker.reset_mock()
     msg2 = _FakeRabbitMessage({RETRY_HEADER: "1"})
-    await worker.handle_retry_or_dlq(body, msg2, broker, RuntimeError("again"))  # type: ignore[arg-type]
+    await consumer.handle_retry_or_dlq(body, msg2, RuntimeError("again"))  # type: ignore[arg-type]
     call = broker.publish.await_args
     assert call.kwargs["headers"][RETRY_HEADER] == "2"
 
     broker.reset_mock()
     msg3 = _FakeRabbitMessage({RETRY_HEADER: "2"})
-    await worker.handle_retry_or_dlq(body, msg3, broker, RuntimeError("last"))  # type: ignore[arg-type]
+    await consumer.handle_retry_or_dlq(body, msg3, RuntimeError("last"))  # type: ignore[arg-type]
     call = broker.publish.await_args
     assert call.kwargs["queue"] == PAYMENTS_DLQ_QUEUE
     assert call.kwargs["headers"][RETRY_HEADER] == "3"
@@ -81,7 +84,9 @@ async def test_send_webhook_retries_then_succeeds(monkeypatch: pytest.MonkeyPatc
                 httpx.Response(200),
             ],
         )
-        ok = await worker.send_webhook_with_retries(
+        from app.consumer.worker import PaymentConsumerService
+        consumer = PaymentConsumerService(AsyncMock(), None)
+        ok = await consumer.send_webhook_with_retries(
             "https://example.test/webhook",
             {"payment_id": "x"},
         )
@@ -105,7 +110,9 @@ async def test_send_webhook_all_fail(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with respx.mock:
         route = respx.post("https://example.test/webhook").mock(return_value=httpx.Response(503))
-        ok = await worker.send_webhook_with_retries(
+        from app.consumer.worker import PaymentConsumerService
+        consumer = PaymentConsumerService(AsyncMock(), None)
+        ok = await consumer.send_webhook_with_retries(
             "https://example.test/webhook",
             {"payment_id": "x"},
         )

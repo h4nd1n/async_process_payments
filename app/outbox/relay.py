@@ -1,63 +1,50 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from collections.abc import Callable
+
 from faststream.rabbit import RabbitBroker
 
 from app.config import get_settings
-from app.db.models import Outbox
 from app.messaging.queues import PAYMENTS_NEW_QUEUE
+from app.repositories.uow import AbstractUnitOfWork
 
 logger = logging.getLogger(__name__)
 
 
-async def process_one_outbox_row(
-    session: AsyncSession,
-    broker: RabbitBroker,
-) -> bool:
-    """Опубликовать одну неотправленную запись outbox. True, если строка обработана."""
-    stmt = (
-        select(Outbox)
-        .where(Outbox.published_at.is_(None))
-        .order_by(Outbox.created_at.asc())
-        .limit(1)
-        .with_for_update(skip_locked=True)
-    )
-    row = await session.scalar(stmt)
-    if row is None:
-        return False
+class OutboxRelayService:
+    def __init__(self, broker: RabbitBroker, uow_factory: Callable[[], AbstractUnitOfWork]):
+        self.broker = broker
+        self.uow_factory = uow_factory
 
-    await broker.publish(
-        row.payload,
-        queue=PAYMENTS_NEW_QUEUE,
-        persist=True,
-    )
-    row.published_at = datetime.now(tz=UTC)
-    return True
+    async def process_one_outbox_row(self) -> bool:
+        """Опубликовать одну неотправленную запись outbox. True, если строка обработана."""
+        async with self.uow_factory() as uow:
+            row_dto = await uow.outboxes.get_oldest_unpublished()
+            if row_dto is None:
+                return False
 
+            await self.broker.publish(
+                row_dto.payload,
+                queue=PAYMENTS_NEW_QUEUE,
+                persist=True,
+            )
+            await uow.outboxes.mark_published(row_dto.id, datetime.now(tz=UTC))
+            return True
 
-async def outbox_relay_loop(
-    broker: RabbitBroker,
-    session_factory: async_sessionmaker[AsyncSession],
-    stop: asyncio.Event,
-) -> None:
-    settings = get_settings()
-    interval = settings.outbox_poll_interval_sec
-    while not stop.is_set():
-        try:
-            batch_work = False
-            async with session_factory() as session:
-                async with session.begin():
-                    while await process_one_outbox_row(session, broker):
-                        batch_work = True
-            if not batch_work:
+    async def run_loop(self, stop_event: asyncio.Event) -> None:
+        settings = get_settings()
+        interval = settings.outbox_poll_interval_sec
+        while not stop_event.is_set():
+            try:
+                batch_work = False
+                while await self.process_one_outbox_row():
+                    batch_work = True
+                if not batch_work:
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Сбой итерации фонового outbox relay")
                 await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Сбой итерации фонового outbox relay")
-            await asyncio.sleep(interval)
